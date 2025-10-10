@@ -7,8 +7,8 @@ import re
 import perth
 from neucodec import NeuCodec, DistillNeuCodec
 from phonemizer.backend import EspeakBackend
-from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer
-from threading import Thread
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from huggingface_hub import snapshot_download
 
 
 def _linear_overlap_add(frames: list[np.ndarray], stride: int) -> np.ndarray:
@@ -103,7 +103,15 @@ class NeuTTSAir:
                 flash_attn=True if backbone_device == "gpu" else False,
             )
             self._is_quantized_model = True
-
+        
+        elif backbone_repo.endswith("onnx"):
+            import onnxruntime as ort
+            repo_path = snapshot_download(backbone_repo)
+            model_path = Path(repo_path) / "model.onnx"
+            self.tokenizer = AutoTokenizer.from_pretrained(repo_path) 
+            self.backbone = ort.InferenceSession(model_path)
+            self._is_onnx_backbone = True
+            
         else:
             self.tokenizer = AutoTokenizer.from_pretrained(backbone_repo)
             self.backbone = AutoModelForCausalLM.from_pretrained(backbone_repo).to(
@@ -156,11 +164,12 @@ class NeuTTSAir:
         """
 
         # Generate tokens
-        if self._is_quantized_model:
-            output_str = self._infer_ggml(ref_codes, ref_text, text)
-        else:
-            prompt_ids = self._apply_chat_template(ref_codes, ref_text, text)
-            output_str = self._infer_torch(prompt_ids)
+        #if self._is_quantized_model:
+        #    output_str = self._infer_ggml(ref_codes, ref_text, text)
+        #else:
+        #    prompt_ids = self._apply_chat_template(ref_codes, ref_text, text)
+        #    output_str = self._infer_torch(prompt_ids)
+        output_str = self._infer_onnx(ref_codes, ref_text, text)
 
         # Decode
         wav = self._decode(output_str)
@@ -272,6 +281,69 @@ class NeuTTSAir:
         output_str = self.tokenizer.decode(
             output_tokens[0, input_length:].cpu().numpy().tolist(), add_special_tokens=False
         )
+        return output_str
+    
+    def _infer_onnx(self, ref_codes: list[int], ref_text: str, input_text: str) -> str:
+        
+        # prepare prompt
+        EOS_TOKEN = self.tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_END|>")
+        ref_text = self._to_phones(ref_text)
+        input_text = self._to_phones(input_text)
+        codes_str = "".join([f"<|speech_{idx}|>" for idx in ref_codes])
+        prompt = (
+            f"user: Convert the text to speech:<|TEXT_PROMPT_START|>{ref_text} {input_text}"
+            f"<|TEXT_PROMPT_END|>\nassistant:<|SPEECH_GENERATION_START|>{codes_str}"
+        )
+
+        # prepare onnx inputs
+        inputs = self.tokenizer(prompt, return_tensors="np")
+        attention_mask = inputs["attention_mask"]
+        past_key_values = {
+            f"past_key_values.{layer}.{kv}": np.zeros([1, 2, 0, 64], dtype=np.float32)
+            for layer in range(24) # (harryjulian) hard-coded n layers for Qwen0.5B atm
+            for kv in ("key", "value")
+        }
+        inputs = inputs | past_key_values
+        input_len = inputs["input_ids"].shape[-1]
+        
+        # generation loop
+        output_tokens = []
+        for i in range(self.max_context - input_len):
+            print(i)
+            
+            # call model
+            logits, *present_key_values = self.backbone.run(None, dict(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                **past_key_values
+            ))
+
+            # sample
+            logits = logits[:, -1, :] / 1.0 # (harryjulian) hard-code temp
+            top_k = 50 # (harryjulian) hard-code top_k
+            top_k_values = np.partition(logits, -top_k, axis=-1)[:, -top_k:]
+            threshold = top_k_values[:, 0:1]
+            logits = np.where(logits < threshold, -np.inf, logits)
+            probs = np.exp(logits - np.max(logits, axis=-1, keepdims=True))
+            probs = probs / np.sum(probs, axis=-1, keepdims=True)
+            next_token = np.array([[np.random.choice(probs.shape[-1], p=probs[0])]], dtype=np.int64)
+            
+            output_tokens.append(next_token.item())
+            if (next_token.flatten() == EOS_TOKEN).all():
+                break
+
+            # reconstruct next inputs
+            attention_mask = np.concatenate([attention_mask, np.ones((1, 1), dtype=np.int64)], axis=1)
+            for j, key in enumerate(past_key_values):
+                past_key_values[key] = present_key_values[j]
+
+            inputs = {
+                "input_ids": next_token,
+                "attention_mask": attention_mask,
+            }
+
+        # decode
+        output_str = self.tokenizer.decode(output_tokens)
         return output_str
     
     def _infer_ggml(self, ref_codes: list[int], ref_text: str, input_text: str) -> str:
