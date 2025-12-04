@@ -11,6 +11,11 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from huggingface_hub import snapshot_download
 
 
+from phonemizer.backend.espeak.wrapper import EspeakWrapper
+_ESPEAK_LIBRARY = '/opt/homebrew/Cellar/espeak/1.48.04_1/lib/libespeak.1.1.48.dylib'  #use the Path to the library.
+EspeakWrapper.set_library(_ESPEAK_LIBRARY)
+
+
 def _linear_overlap_add(frames: list[np.ndarray], stride: int) -> np.ndarray:
     # original impl --> https://github.com/facebookresearch/encodec/blob/main/encodec/utils.py
     assert len(frames)
@@ -81,43 +86,15 @@ class NeuTTSAir:
     def _load_backbone(self, backbone_repo, backbone_device):
         print(f"Loading backbone from: {backbone_repo} on {backbone_device} ...")
 
-        # GGUF loading
-        if backbone_repo.endswith("gguf"):
-
-            try:
-                from llama_cpp import Llama
-            except ImportError as e:
-                raise ImportError(
-                    "Failed to import `llama_cpp`. "
-                    "Please install it with:\n"
-                    "    pip install llama-cpp-python"
-                ) from e
-
-            self.backbone = Llama.from_pretrained(
-                repo_id=backbone_repo,
-                filename="*.gguf",
-                verbose=False,
-                n_gpu_layers=-1 if backbone_device == "gpu" else 0,
-                n_ctx=self.max_context,
-                mlock=True,
-                flash_attn=True if backbone_device == "gpu" else False,
-            )
-            self._is_quantized_model = True
-        
-        elif backbone_repo.endswith("onnx"):
-            import onnxruntime as ort
-            repo_path = snapshot_download(backbone_repo)
-            model_path = Path(repo_path) / "model.onnx"
-            self.tokenizer = AutoTokenizer.from_pretrained(repo_path) 
-            self.backbone = ort.InferenceSession(model_path)
-            self._is_onnx_backbone = True
-            
-        else:
-            self.tokenizer = AutoTokenizer.from_pretrained(backbone_repo)
-            self.backbone = AutoModelForCausalLM.from_pretrained(backbone_repo).to(
-                torch.device(backbone_device)
-            )
-
+        import onnxruntime as ort
+        repo_path = snapshot_download(backbone_repo)
+        model_path = Path(repo_path) / "model.onnx"
+        self.tokenizer = AutoTokenizer.from_pretrained(repo_path)        
+        self.backbone = ort.InferenceSession(
+            model_path,
+        )
+        self._is_onnx_backbone = True
+    
     def _load_codec(self, codec_repo, codec_device):
 
         print(f"Loading codec from: {codec_repo} on {codec_device} ...")
@@ -128,7 +105,7 @@ class NeuTTSAir:
             case "neuphonic/distill-neucodec":
                 self.codec = DistillNeuCodec.from_pretrained(codec_repo)
                 self.codec.eval().to(codec_device)
-            case "neuphonic/neucodec-onnx-decoder":
+            case "neuphonic/neucodec-onnx-decoder-int8":
 
                 if codec_device != "cpu":
                     raise ValueError("Onnx decoder only currently runs on CPU.")
@@ -308,6 +285,8 @@ class NeuTTSAir:
         
         # generation loop
         output_tokens = []
+        import time
+        st = time.time()
         for i in range(self.max_context - input_len):
             print(i)
             
@@ -341,6 +320,9 @@ class NeuTTSAir:
                 "input_ids": next_token,
                 "attention_mask": attention_mask,
             }
+        fi = time.time()
+        print(f"{fi - st:.2f}")
+        print(f"{len(output_tokens) / (fi - st)}")
 
         # decode
         output_str = self.tokenizer.decode(output_tokens)
